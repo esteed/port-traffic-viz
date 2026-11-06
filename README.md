@@ -11,9 +11,13 @@ A live isometric view of network traffic on this Windows machine, one bar per po
 
 ## Run it
 
+Download `PortTraffic.exe` from the
+[latest release](https://github.com/esteed/port-traffic-viz/releases/latest), or
+build it yourself (see below).
+
 | | |
 |---|---|
-| `dist\PortTraffic.exe` | The desktop app. Windows asks for administrator rights, then the view opens in its own window. Close the window to stop. |
+| `PortTraffic.exe` | The desktop app. Windows asks for administrator rights, then the view opens in its own window. Close the window to stop. |
 | `PortTraffic.exe --demo` | Simulated traffic, no administrator rights needed. |
 | `start.cmd`, `start-demo.cmd` | The same view in your browser instead, run from source (needs Python). |
 
