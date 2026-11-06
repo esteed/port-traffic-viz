@@ -1,0 +1,5 @@
+* text=auto eol=lf
+# cmd.exe can misread labels and goto in batch files with LF endings
+*.cmd text eol=crlf
+*.ico binary
+*.exe binary

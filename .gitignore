@@ -1,0 +1,10 @@
+# Built by build.cmd; rebuild instead of committing the binary
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

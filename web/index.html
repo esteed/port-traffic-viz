@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Port traffic</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <h1>Port traffic</h1>
+    <span id="status" class="pill">Connecting…</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><span class="k">In</span><span id="st-in" class="v">–</span></div>
+    <div class="stat"><span class="k">Out</span><span id="st-out" class="v">–</span></div>
+    <div class="stat"><span class="k">Active ports</span><span id="st-act" class="v">–</span></div>
+  </div>
+  <div class="controls">
+    <div class="seg" id="ctl-side" role="group" aria-label="Which end of each connection to count">
+      <button type="button" data-v="both" class="on" title="Count bytes at both the local and the remote port">Both ends</button>
+      <button type="button" data-v="local" title="Only this machine's port for each connection">Local</button>
+      <button type="button" data-v="remote" title="Only the peer's port, such as 443 for websites">Remote</button>
+    </div>
+    <div class="seg" id="ctl-proto" role="group" aria-label="Protocol">
+      <button type="button" data-v="all" class="on">All</button>
+      <button type="button" data-v="tcp">TCP</button>
+      <button type="button" data-v="udp">UDP</button>
+    </div>
+    <label class="sel">Scale
+      <select id="ctl-scale">
+        <option value="1e7">10 Mb/s</option>
+        <option value="1e8">100 Mb/s</option>
+        <option value="1e9" selected>1 Gb/s</option>
+        <option value="1e10">10 Gb/s</option>
+      </select>
+    </label>
+    <button type="button" id="ctl-zoom">Fit to window</button>
+    <button type="button" id="ctl-pause">Pause</button>
+  </div>
+</header>
+<main>
+  <div id="stage">
+    <canvas id="cv" role="img" aria-label="Isometric bar grid of traffic per network port. The busiest ports are listed alongside."></canvas>
+    <div id="tip" class="tip" hidden></div>
+    <div class="legend">
+      <span class="item">Traffic per port, log scale
+        <span class="muted">100 b/s</span><span id="swatches" class="swatches"></span><span id="scale-max" class="muted">1 Gb/s</span>
+      </span>
+      <span class="item"><span id="dyn-swatch" class="sw"></span>Dynamic range 49152–65535</span>
+      <span class="item muted">Hover a cell for details · click to pin</span>
+    </div>
+  </div>
+  <aside>
+    <h2>Busiest ports</h2>
+    <ol id="top"><li class="empty">Waiting for traffic…</li></ol>
+  </aside>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
