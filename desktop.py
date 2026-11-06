@@ -231,7 +231,7 @@ def describe(exc: BaseException) -> str:
 
 def run_capture(port: int, parent_pid: int) -> int:
     try:
-        srv = server.Server("live", port, exact_port=True)
+        srv = server.Server("live", port, exact_port=True, owner_pid=parent_pid or None)
     except BaseException as exc:  # noqa: BLE001 - reported to the window
         try:
             os.makedirs(APP_DIR, exist_ok=True)
@@ -298,7 +298,10 @@ class App:
             background_color="#1a1a19" if self.dark else "#fcfcfb")
         self.window.expose(self.try_live, self.show_demo)
         self.window.events.shown += lambda: dark_title_bar(self.dark)
-        webview.start(self.boot, gui="edgechromium")
+        # Not private mode, so the page's settings (sample rate, hiding own
+        # traffic) are still there next time.
+        webview.start(self.boot, gui="edgechromium", private_mode=False,
+                      storage_path=os.path.join(APP_DIR, "webview"))
         if self.srv:
             self.srv.shutdown()
         return 0

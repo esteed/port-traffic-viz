@@ -12,21 +12,37 @@ const BX = 540, BY = 536;             // world origin of the 1–1024 block
 const HI_COLS = 256, HI_ROWS = 252;   // 1025–65535 field: 2 px cells
 const MIN_RATE = 100;                 // bits/s at the floor of the log scale
 const RATE_WINDOW = 0.5;              // seconds of samples averaged into each rate
-const PANEL_MS = 250;                 // redraw the list and header numbers 4 times a second
-let windowTicks = 10;                 // RATE_WINDOW / tick length (20 ticks/s), set from /api/info
-let lastPanel = 0;
+const STATS_SECONDS = 0.25;           // the header numbers redraw 4 times a second
+const LIST_SECONDS = 1;               // the busiest-ports list redraws once a second
+const RATES = [20, 10, 5, 2, 1];      // samples a second the server can be set to
+const MAX_ZOOM = 16;
+const LEGEND_H = 34;                  // room left under the scene for the legend
+const OWN = [255, 255, 255];          // this app's own traffic is drawn white
+
+let tick = 0.05;                      // seconds between samples (the server says)
+let windowTicks = 10, statsEvery = 5, listEvery = 20;
+let statsIn = 0, listIn = 0;          // samples until the next redraw of each
+let rateRestored = false;
 
 const state = {
-  side: 'both', proto: 'all', max: 1e9, zoom: 'actual', paused: false,
-  mode: null, connected: false, services: {}, hover: null, pin: null, mouse: null,
+  side: 'both', proto: 'all', max: 1e9, paused: false, hideOwn: false,
+  mode: null, connected: false, services: {}, hover: null, pins: [], mouse: null,
 };
-const ports = new Map();              // port -> { c, hist, proc, rate, target, h }
-const dts = [];                       // last windowTicks tick lengths
-const dirHist = [];                   // last windowTicks [bytesIn, bytesOut]
+// port -> { c, hist, proc, rate, base, own, target, btarget, h, hb }
+// base is traffic this app didn't cause, own is traffic it did, and rate is
+// what's shown: base plus own, unless own traffic is hidden.
+const ports = new Map();
+const dts = [];                       // last windowTicks sample lengths
+const dirHist = [];                   // last windowTicks [in, out, own in, own out]
 let tickNo = 0;
 
 const $ = id => document.getElementById(id);
 const stage = $('stage'), cv = $('cv'), ctx = cv.getContext('2d'), tip = $('tip');
+
+// Settings that survive a restart. Storage can be off; then they just don't.
+const PREF = 'portTraffic.';
+function loadPref(k) { try { return JSON.parse(localStorage.getItem(PREF + k)); } catch { return null; } }
+function savePref(k, v) { try { localStorage.setItem(PREF + k, JSON.stringify(v)); } catch { /* not kept */ } }
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -51,7 +67,6 @@ function readTheme() {
   });
   T.lut = makeRamp(T.stops);
   $('swatches').innerHTML = [0.1, 0.3, 0.5, 0.7, 0.9].map(t => `<span style="background:${rgb(ramp(t))}"></span>`).join('');
-  $('dyn-swatch').style.background = T.dyn;
 }
 
 // OKLCH -> sRGB 0-255, lowering chroma until the color fits in sRGB.
@@ -99,13 +114,12 @@ function cellOf(p) {
 }
 
 function svcName(p) {
-  return state.services[p] || (p >= 49152 ? 'dynamic' : '');
+  return state.services[p] || (p >= 49152 ? 'ephemeral' : '');
 }
 
 function zoneName(p) {
-  if (p <= 1023) return 'Well-known';
-  if (p === 1024) return 'Registered';
-  return p >= 49152 ? 'Dynamic' : 'Registered';
+  if (p <= 1023) return 'Well-known port';
+  return p >= 49152 ? 'Ephemeral port' : 'Registered port';
 }
 
 // Pick the bytes that match the current filters out of [tcpL, tcpR, udpL, udpR].
@@ -132,6 +146,7 @@ function fmtRate(bps) {
 }
 
 const esc = s => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+const pinned = p => state.pins.includes(p);
 
 function windowSpan() {
   return dts.reduce((a, b) => a + b, 0) || 1;
@@ -141,45 +156,81 @@ function recompute() {
   const span = windowSpan();
   for (const [p, e] of ports) {
     while (e.hist.length && e.hist[0].n <= tickNo - windowTicks) e.hist.shift();
-    let bytes = 0;
-    for (const s of e.hist) bytes += pick(s.v);
-    e.rate = bytes * 8 / span;
+    let base = 0, own = 0;
+    for (const s of e.hist) {
+      base += pick(s.v);
+      if (s.o) own += pick(s.o);
+    }
+    e.base = base * 8 / span;
+    e.own = own * 8 / span;
+    e.rate = e.base + (state.hideOwn ? 0 : e.own);
     e.target = norm(e.rate) * MAXH;
-    if (!e.hist.length && e.h < 0.3 && state.pin !== p) ports.delete(p);
+    e.btarget = norm(e.base) * MAXH;
+    if (!e.hist.length && e.h < 0.3 && !pinned(p)) ports.delete(p);
   }
 }
 
+function entry(p) {
+  if (p < 1 || p > 65535) return null;
+  let e = ports.get(p);
+  if (!e) {
+    e = { c: cellOf(p), hist: [], proc: '', rate: 0, base: 0, own: 0, target: 0, btarget: 0, h: 0, hb: 0 };
+    ports.set(p, e);
+  }
+  return e;
+}
+
+// The server's sample length sets how many samples make up each average and
+// how often the text redraws.
+function setTick(t) {
+  tick = t;
+  windowTicks = Math.max(1, Math.round(RATE_WINDOW / t));
+  statsEvery = Math.max(1, Math.round(STATS_SECONDS / t));
+  listEvery = Math.max(1, Math.round(LIST_SECONDS / t));
+  statsIn = Math.min(statsIn, statsEvery);
+  listIn = Math.min(listIn, listEvery);
+  $('ctl-rate').value = String(Math.round(1 / t));
+}
+
 function onTick(m) {
+  if (m.t && m.t !== tick) setTick(m.t);
   if (state.paused) return;
   tickNo++;
   dts.push(m.dt);
-  dirHist.push([m.in, m.out]);
+  dirHist.push([m.in, m.out, m.si || 0, m.so || 0]);
   while (dts.length > windowTicks) { dts.shift(); dirHist.shift(); }
   for (const [p, tl, tr, ul, ur, proc] of m.p) {
-    if (p < 1 || p > 65535) continue;
-    let e = ports.get(p);
-    if (!e) {
-      e = { c: cellOf(p), hist: [], proc: '', rate: 0, target: 0, h: 0 };
-      ports.set(p, e);
-    }
-    e.hist.push({ n: tickNo, v: [tl, tr, ul, ur] });
+    const e = entry(p);
+    if (!e) continue;
+    e.hist.push({ n: tickNo, v: [tl, tr, ul, ur], o: null });
     if (proc) e.proc = proc;
   }
+  for (const [p, tl, tr, ul, ur] of m.s || []) {   // this app's own traffic
+    const e = entry(p);
+    if (!e) continue;
+    const last = e.hist[e.hist.length - 1];
+    if (last && last.n === tickNo) last.o = [tl, tr, ul, ur];
+    else e.hist.push({ n: tickNo, v: [0, 0, 0, 0], o: [tl, tr, ul, ur] });
+  }
   recompute();
-  // Bars follow every tick; text redraws less often so it stays readable.
-  const now = performance.now();
-  if (now - lastPanel >= PANEL_MS) {
-    lastPanel = now;
+  // Bars follow every sample; text redraws less often so it stays readable.
+  if (--statsIn <= 0) {
+    statsIn = statsEvery;
     renderStats();
-    renderTop();
     if (state.hover != null && state.mouse) showTip();
+  }
+  if (--listIn <= 0) {
+    listIn = listEvery;
+    renderTop();
   }
 }
 
 // ---------------------------------------------------------------------------
 // Drawing primitives
 // ---------------------------------------------------------------------------
-let K = 1, dpr = 1, offX = 0, offY = 0, layerBig = null, layerSmall = null;
+// K is the zoom; offX/offY place the scene's top-left corner in the canvas.
+let K = 1, dpr = 1, offX = 0, offY = 0, viewW = 0, viewH = 0, userView = false;
+let layerBig = null, layerSmall = null, layersDirty = true, checkTile = null;
 
 const proj = (x, y, z = 0) => [OX + (x - y) * C, OY + (x + y) * S - z];
 const quad = (x, y, w, d, z = 0) => [[x, y, z], [x + w, y, z], [x + w, y + d, z], [x, y + d, z]];
@@ -200,10 +251,18 @@ function slab(g, x, y, w, d, t, top) {
   poly(g, quad(x, y, w, d), top);
 }
 
-function box(g, x, y, s, h, col) {
-  poly(g, [[x, y + s, 0], [x + s, y + s, 0], [x + s, y + s, h], [x, y + s, h]], rgb(col, T.shadeL));
-  poly(g, [[x + s, y, 0], [x + s, y + s, 0], [x + s, y + s, h], [x + s, y, h]], rgb(col, T.shadeR));
+// A bar from height z0 up to h.
+function box(g, x, y, s, h, col, z0 = 0) {
+  poly(g, [[x, y + s, z0], [x + s, y + s, z0], [x + s, y + s, h], [x, y + s, h]], rgb(col, T.shadeL));
+  poly(g, [[x + s, y, z0], [x + s, y + s, z0], [x + s, y + s, h], [x + s, y, h]], rgb(col, T.shadeR));
   poly(g, quad(x, y, s, s, h), rgb(col));
+}
+
+// Other traffic in color at the bottom, this app's own stacked on top in white.
+function drawBar(g, e) {
+  const c = e.c, hb = Math.min(e.hb, e.h);
+  if (hb > 0.3) box(g, c.x, c.y, c.s, hb, ramp(hb / MAXH));
+  if (e.h - hb > 0.3) box(g, c.x, c.y, c.s, e.h, OWN, hb > 0.3 ? hb : 0);
 }
 
 // Text sizes are in screen px, so labels stay readable at any zoom.
@@ -233,20 +292,55 @@ function makeLayer() {
   return [c, g];
 }
 
-// Floors are static, so they're drawn once per resize into two layers: the big
-// field (behind everything) and the small block (in front of the big field's bars).
+// The faint checkerboard on the big field, filled as a pattern laid onto the
+// floor plane so it costs the same at any zoom. The tile is drawn 8x larger
+// than one 2 px cell so it stays sharp when zoomed in.
+function checker(g, x, y, w, d) {
+  if (!checkTile) {
+    checkTile = document.createElement('canvas');
+    checkTile.width = checkTile.height = 32;
+  }
+  const t = checkTile.getContext('2d');
+  t.clearRect(0, 0, 32, 32);
+  t.fillStyle = T.check;
+  t.fillRect(0, 0, 16, 16);
+  t.fillRect(16, 16, 16, 16);
+  const pat = g.createPattern(checkTile, 'repeat');
+  pat.setTransform(new DOMMatrix().scale(1 / 8));
+  g.save();
+  g.transform(C, S, -C, S, OX, OY);   // world floor (x, y) -> scene
+  g.fillStyle = pat;
+  g.fillRect(x, y, w, d);
+  g.restore();
+}
+
+// Printed along the front edge of the ephemeral band, like a label on the floor.
+// Zoomed out it shrinks with the floor, so it never runs past the edge.
+function ephemeralNote(g) {
+  const [x, y] = proj(4, HI_ROWS * 2);
+  const size = 12 * Math.min(1, K);
+  g.save();
+  g.translate(x, y);
+  g.rotate(Math.atan2(S, C));   // the world x axis runs 30° below horizontal
+  const dy = 5 / C + size * 0.85 / K;   // clear of the floor's 5 px edge
+  const head = 'Ephemeral ports 49152–65535';
+  font(g, size, 600);
+  const w = g.measureText(head).width;
+  text(g, head, 0, dy, size, T.ink2, 'left', 600);
+  text(g, '  ·  Windows assigns them to outgoing connections', w, dy, size, T.muted);
+  g.restore();
+}
+
+// Floors are static, so they're drawn into two layers whenever the view
+// changes: the big field (behind everything) and the small block (in front of
+// the big field's bars).
 function buildLayers() {
   let g;
   [layerBig, g] = makeLayer();
   slab(g, 0, 0, HI_COLS * 2, HI_ROWS * 2, 5, T.floor);
   poly(g, quad(0, 376, 512, 128), T.dyn);          // rows from 49152 onward
   poly(g, quad(510, 374, 2, 2), T.dyn);            // 49152 is the last cell of row 187
-  g.beginPath();
-  for (let r = 0; r < HI_ROWS; r++) {
-    for (let c = r & 1; c < HI_COLS; c += 2) path(g, quad(c * 2, r * 2, 2, 2));
-  }
-  g.fillStyle = T.check;
-  g.fill();
+  checker(g, 0, 0, HI_COLS * 2, HI_ROWS * 2);
   g.beginPath();
   for (let k = 32; k < 512; k += 32) { const a = proj(k, 0), b = proj(k, 504); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); }
   for (let k = 32; k < 504; k += 32) { const a = proj(0, k), b = proj(512, k); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); }
@@ -259,7 +353,7 @@ function buildLayers() {
     text(g, dyn ? '49152' : String(1025 + 256 * r), a - 8 / K, b, 11, dyn ? T.ink2 : T.muted, 'right', dyn ? 600 : 400);
   }
   text(g, 'Ports 1025–65535', 24, 34, 13, T.ink, 'left', 600);
-  text(g, '256 × 252 grid · 2 px bars', 24, 34 + 19 / K, 12, T.muted);
+  ephemeralNote(g);
 
   [layerSmall, g] = makeLayer();
   slab(g, BX, BY, 160, 160, 5, T.gap);
@@ -272,23 +366,88 @@ function buildLayers() {
   [a, b] = proj(BX + 160, BY + 160);
   text(g, '1024', a, b + 5 + 12 / K, 11, T.muted, 'center');
   text(g, 'Ports 1–1024', OX + 190, OY + 618, 13, T.ink, 'left', 600);
-  text(g, '32 × 32 grid · 5 px bars', OX + 190, OY + 618 + 19 / K, 12, T.muted);
+}
+
+// ---------------------------------------------------------------------------
+// View: zoom with the mouse wheel, move by dragging
+// ---------------------------------------------------------------------------
+const startScale = () => Math.min(1, viewW / W, (viewH - LEGEND_H) / H);
+
+function resetView() {
+  K = startScale();
+  offX = Math.round((viewW - W * K) / 2);
+  offY = Math.max(0, Math.round((viewH - LEGEND_H - H * K) / 2));
+  userView = false;
+  layersDirty = true;
+}
+
+// Keep at least a corner of the scene on screen.
+function clampView() {
+  const m = 60;
+  offX = Math.min(viewW - m, Math.max(m - W * K, offX));
+  offY = Math.min(viewH - m, Math.max(m - H * K, offY));
+}
+
+function zoomAt(mx, my, f) {
+  const k = Math.min(MAX_ZOOM, Math.max(startScale() / 2, K * f));
+  if (k === K) return;
+  offX = mx - (mx - offX) * k / K;   // keep the point under the mouse where it is
+  offY = my - (my - offY) * k / K;
+  K = k;
+  clampView();
+  userView = true;
+  layersDirty = true;
 }
 
 function layout() {
   const r = stage.getBoundingClientRect();
   if (!r.width || !r.height) return;
+  const oldW = viewW, oldH = viewH;
+  viewW = r.width;
+  viewH = r.height;
   dpr = window.devicePixelRatio || 1;
-  const fit = Math.min(r.width / W, (r.height - 34) / H);   // leave room for the legend
-  K = state.zoom === 'fit' ? fit : Math.min(1, fit);
-  offX = Math.round((r.width - W * K) / 2);
-  offY = Math.max(0, Math.round((r.height - 34 - H * K) / 2));
   cv.width = Math.round(r.width * dpr);
   cv.height = Math.round(r.height * dpr);
   cv.style.width = r.width + 'px';
   cv.style.height = r.height + 'px';
-  buildLayers();
+  if (!userView || !oldW) {
+    resetView();
+  } else {   // keep what was in the middle in the middle
+    offX += (viewW - oldW) / 2;
+    offY += (viewH - oldH) / 2;
+    clampView();
+  }
+  layersDirty = true;
 }
+
+let drag = null;
+cv.addEventListener('mousedown', ev => {
+  if (ev.button !== 0) return;
+  ev.preventDefault();
+  drag = { x: ev.clientX, y: ev.clientY, ox: offX, oy: offY };
+  cv.classList.add('dragging');
+  state.hover = null;
+  tip.hidden = true;
+});
+window.addEventListener('mousemove', ev => {
+  if (!drag) return;
+  offX = drag.ox + ev.clientX - drag.x;
+  offY = drag.oy + ev.clientY - drag.y;
+  clampView();
+  userView = true;
+  layersDirty = true;
+});
+window.addEventListener('mouseup', () => {
+  if (!drag) return;
+  drag = null;
+  cv.classList.remove('dragging');
+});
+cv.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const r = cv.getBoundingClientRect();
+  const dy = ev.deltaMode === 1 ? ev.deltaY * 33 : ev.deltaMode === 2 ? ev.deltaY * viewH : ev.deltaY;
+  zoomAt(ev.clientX - r.left, ev.clientY - r.top, Math.pow(1.2, -dy / 100));   // 1.2x per notch
+}, { passive: false });
 
 // ---------------------------------------------------------------------------
 // Frame
@@ -307,8 +466,10 @@ function label(g, p, e, x, y, align) {
 
 function drawLabels(g, bars) {
   const chosen = bars.filter(b => b.e.h > 6).sort((a, b) => b.e.rate - a.e.rate).slice(0, 3);
-  const pinned = state.pin != null && ports.get(state.pin);
-  if (pinned && !chosen.some(b => b.p === state.pin)) chosen.push({ p: state.pin, e: pinned });
+  for (const p of state.pins) {
+    const e = ports.get(p);
+    if (e && !chosen.some(b => b.p === p)) chosen.push({ p, e });
+  }
   const placed = [], hh = 18 / K;
   for (const b of chosen) {
     const c = b.e.c;
@@ -344,15 +505,21 @@ function draw() {
 
   ctx.drawImage(layerBig, 0, 0);
   setScene(ctx);
-  for (const b of bars) if (!b.e.c.low) box(ctx, b.e.c.x, b.e.c.y, b.e.c.s, b.e.h, ramp(b.e.h / MAXH));
+  for (const b of bars) if (!b.e.c.low) drawBar(ctx, b.e);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(layerSmall, 0, 0);
   setScene(ctx);
-  for (const b of bars) if (b.e.c.low) box(ctx, b.e.c.x, b.e.c.y, b.e.c.s, b.e.h, ramp(b.e.h / MAXH));
+  for (const b of bars) if (b.e.c.low) drawBar(ctx, b.e);
 
-  if (state.pin != null) drawHighlight(ctx, state.pin, true);
-  if (state.hover != null && state.hover !== state.pin) drawHighlight(ctx, state.hover, false);
+  for (const p of state.pins) drawHighlight(ctx, p, true);
+  if (state.hover != null && !pinned(state.hover)) drawHighlight(ctx, state.hover, false);
   drawLabels(ctx, bars);
+}
+
+function ease(h, target, dt) {
+  const tau = target > h ? 0.12 : 0.45;   // rise fast, fall slower
+  h += (target - h) * (1 - Math.exp(-dt / tau));
+  return Math.abs(target - h) < 0.05 ? target : h;
 }
 
 let lastFrame = performance.now();
@@ -360,17 +527,20 @@ function frame(t) {
   const dt = Math.min(0.1, (t - lastFrame) / 1000);
   lastFrame = t;
   if ((window.devicePixelRatio || 1) !== dpr) layout();
+  if (layersDirty) {
+    layersDirty = false;
+    buildLayers();
+  }
   for (const e of ports.values()) {
-    const tau = e.target > e.h ? 0.12 : 0.45;   // rise fast, fall slower
-    e.h += (e.target - e.h) * (1 - Math.exp(-dt / tau));
-    if (Math.abs(e.target - e.h) < 0.05) e.h = e.target;
+    e.h = ease(e.h, e.target, dt);
+    e.hb = ease(e.hb, e.btarget, dt);
   }
   draw();
   requestAnimationFrame(frame);
 }
 
 // ---------------------------------------------------------------------------
-// Hover, pin, tooltip
+// Hover and tooltip
 // ---------------------------------------------------------------------------
 function floorPort(mx, my) {
   const a = (mx - OX) / C, b = (my - OY) / S;   // a = x − y, b = x + y
@@ -403,26 +573,31 @@ function hitTest(mx, my) {
 
 function showTip() {
   const p = state.hover;
-  if (p == null) { tip.hidden = true; return; }
+  if (p == null || drag) { tip.hidden = true; return; }
   const e = ports.get(p);
   const name = svcName(p);
+  const span = windowSpan(), r = b => fmtRate(b * 8 / span);
   let html = `<div class="head"><span class="port">${p}</span>${name ? ' · ' + esc(name) : ''}</div>`;
   if (e && e.rate > 0) {
-    const span = windowSpan();
     let tcp = 0, udp = 0, loc = 0, rem = 0;
     for (const s of e.hist) {
-      tcp += s.v[0] + s.v[1]; udp += s.v[2] + s.v[3];
-      loc += s.v[0] + s.v[2]; rem += s.v[1] + s.v[3];
+      for (const v of s.o && !state.hideOwn ? [s.v, s.o] : [s.v]) {
+        tcp += v[0] + v[1]; udp += v[2] + v[3];
+        loc += v[0] + v[2]; rem += v[1] + v[3];
+      }
     }
-    const r = b => fmtRate(b * 8 / span);
     html += `<div>${fmtRate(e.rate)}</div>`;
     if (e.proc) html += `<div class="sub">${esc(e.proc)}</div>`;
     html += `<div class="faint">TCP ${r(tcp)} · UDP ${r(udp)}</div>`;
     html += `<div class="faint">As local port ${r(loc)} · as remote ${r(rem)}</div>`;
-  } else {
+  }
+  if (e && e.own > 0) {
+    html += `<div class="faint"><span class="sw own"></span>This app's own traffic ${fmtRate(e.own)}${state.hideOwn ? ' (hidden)' : ''}</div>`;
+  }
+  if (!e || (e.rate <= 0 && e.own <= 0)) {
     html += `<div class="faint">No traffic in the last ${+windowSpan().toFixed(1)} s</div>`;
   }
-  html += `<div class="faint">${zoneName(p)} · ${p <= 1024 ? 5 : 2} px cell</div>`;
+  html += `<div class="faint">${zoneName(p)}</div>`;
   tip.innerHTML = html;
   tip.hidden = false;
   const sr = stage.getBoundingClientRect();
@@ -439,17 +614,10 @@ function portAt(ev) {
 }
 cv.addEventListener('mousemove', ev => {
   state.mouse = [ev.clientX, ev.clientY];
-  state.hover = portAt(ev);
-  cv.style.cursor = state.hover != null ? 'pointer' : 'default';
+  state.hover = drag ? null : portAt(ev);
   showTip();
 });
 cv.addEventListener('mouseleave', () => { state.hover = null; state.mouse = null; tip.hidden = true; });
-cv.addEventListener('click', ev => setPin(portAt(ev)));
-
-function setPin(p) {
-  state.pin = p == null || state.pin === p ? null : p;
-  renderTop();
-}
 
 // ---------------------------------------------------------------------------
 // Header stats and the busiest-ports list
@@ -457,7 +625,10 @@ function setPin(p) {
 function renderStats() {
   const span = windowSpan();
   let bin = 0, bout = 0;
-  for (const [i, o] of dirHist) { bin += i; bout += o; }
+  for (const [i, o, oi, oo] of dirHist) {
+    bin += state.hideOwn ? i - oi : i;
+    bout += state.hideOwn ? o - oo : o;
+  }
   $('st-in').textContent = fmtRate(bin * 8 / span);
   $('st-out').textContent = fmtRate(bout * 8 / span);
   let n = 0;
@@ -465,31 +636,50 @@ function renderStats() {
   $('st-act').textContent = n.toLocaleString();
 }
 
-function renderTop() {
-  const list = [...ports].filter(([, e]) => e.rate > 0).sort((a, b) => b[1].rate - a[1].rate).slice(0, 16);
-  if (state.pin != null && !list.some(([p]) => p === state.pin)) {
-    list.push([state.pin, ports.get(state.pin) || { rate: 0, proc: '' }]);
-  }
-  $('top').innerHTML = list.length ? list.map(([p, e]) => {
-    const t = norm(e.rate);
-    return `<li data-port="${p}" class="${state.pin === p ? 'pin' : ''}">` +
-      `<span class="p">${p}</span>` +
-      `<span class="n">${esc(svcName(p) || '—')}${e.proc ? `<small>${esc(e.proc)}</small>` : ''}</span>` +
-      `<span class="r">${e.rate > 0 ? fmtRate(e.rate) : 'idle'}</span>` +
-      `<span class="m"><i style="width:${(t * 100).toFixed(1)}%;background:${rgb(ramp(t))}"></i></span></li>`;
-  }).join('') : `<li class="empty">${state.connected ? 'No traffic yet' : 'Waiting for the server…'}</li>`;
+function listRow(p, e) {
+  const rate = e ? e.rate : 0;
+  const t = norm(rate), tb = e && e.base > 0 ? Math.min(t, norm(e.base)) : 0;
+  const who = e && e.proc ? e.proc : e && e.base <= 0 && e.own > 0 ? 'this app' : '';
+  const ownBar = t - tb > 0.001 ? `<i class="own" style="width:${((t - tb) * 100).toFixed(1)}%"></i>` : '';
+  return `<li data-port="${p}" class="${pinned(p) ? 'pin' : ''}">` +
+    `<span class="p">${p}</span>` +
+    `<span class="n">${esc(svcName(p) || '—')}${who ? `<small>${esc(who)}</small>` : ''}</span>` +
+    `<span class="r">${rate > 0 ? fmtRate(rate) : 'idle'}</span>` +
+    `<span class="m"><i style="width:${(tb * 100).toFixed(1)}%;background:${rgb(ramp(tb))}"></i>${ownBar}</span></li>`;
 }
 
-// mousedown, not click: the list is rebuilt between press and release often
-// enough that a click would land on the list instead of the row.
+// Pinned ports first, in the order they were pinned, then the busiest others.
+function renderTop() {
+  const rest = [...ports].filter(([p, e]) => e.rate > 0 && !pinned(p))
+    .sort((a, b) => b[1].rate - a[1].rate).slice(0, 16);
+  const rows = state.pins.map(p => listRow(p, ports.get(p))).concat(rest.map(([p, e]) => listRow(p, e)));
+  $('top').innerHTML = rows.length ? rows.join('')
+    : `<li class="empty">${state.connected ? 'No traffic yet' : 'Waiting for the server…'}</li>`;
+}
+
+function togglePin(p) {
+  const i = state.pins.indexOf(p);
+  if (i >= 0) state.pins.splice(i, 1);
+  else state.pins.push(p);
+  renderTop();
+}
+
+// mousedown, not click: the list can be rebuilt between press and release,
+// and then a click would land on the list instead of the row.
 $('top').addEventListener('mousedown', ev => {
   const li = ev.target.closest('li[data-port]');
-  if (li) setPin(Number(li.dataset.port));
+  if (li) togglePin(Number(li.dataset.port));
 });
 
 // ---------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------
+function refresh() {
+  recompute();
+  renderStats();
+  renderTop();
+}
+
 function segmented(id, key) {
   const el = $(id);
   el.addEventListener('click', ev => {
@@ -497,9 +687,7 @@ function segmented(id, key) {
     if (!b) return;
     state[key] = b.dataset.v;
     for (const x of el.querySelectorAll('button')) x.classList.toggle('on', x === b);
-    recompute();
-    renderStats();
-    renderTop();
+    refresh();
   });
 }
 segmented('ctl-side', 'side');
@@ -512,11 +700,36 @@ $('ctl-scale').addEventListener('change', ev => {
   renderTop();
 });
 
-$('ctl-zoom').addEventListener('click', ev => {
-  state.zoom = state.zoom === 'fit' ? 'actual' : 'fit';
-  ev.target.textContent = state.zoom === 'fit' ? 'Actual pixels' : 'Fit to window';
-  layout();
+async function postRate(hz) {
+  const res = await fetch('/api/rate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hz }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+// The samples that arrive next carry the new rate and update the controls.
+$('ctl-rate').addEventListener('change', async ev => {
+  const hz = Number(ev.target.value);
+  savePref('rate', hz);
+  try {
+    await postRate(hz);
+  } catch {
+    ev.target.value = String(Math.round(1 / tick));
+  }
 });
+
+function renderOwn() {
+  $('ctl-own').checked = state.hideOwn;
+  $('own-text').textContent = state.hideOwn ? "This app's own traffic: hidden" : "This app's own traffic";
+}
+$('ctl-own').addEventListener('change', ev => {
+  state.hideOwn = ev.target.checked;
+  savePref('hideOwn', state.hideOwn);
+  renderOwn();
+  refresh();
+});
+
+$('ctl-zoom').addEventListener('click', resetView);
 
 $('ctl-pause').addEventListener('click', ev => {
   state.paused = !state.paused;
@@ -544,8 +757,15 @@ async function loadInfo() {
     const info = await (await fetch('/api/info', { cache: 'no-store' })).json();
     state.mode = info.mode;
     state.services = info.services || {};
-    if (info.tick > 0) windowTicks = Math.max(1, Math.round(RATE_WINDOW / info.tick));
+    if (info.tick > 0) setTick(info.tick);
     document.title = `Port traffic · ${info.host}`;
+    // Put back the sample rate chosen last time.
+    const want = loadPref('rate');
+    if (!rateRestored && RATES.includes(want) && Math.round(1 / info.tick) !== want) {
+      $('ctl-rate').value = String(want);
+      postRate(want).catch(() => { $('ctl-rate').value = String(Math.round(1 / tick)); });
+    }
+    rateRestored = true;
   } catch {
     // The stream's reconnect will retry; names just stay blank meanwhile.
   }
@@ -563,8 +783,10 @@ function connect() {
   es.onerror = () => { state.connected = false; renderStatus(); };
 }
 
+state.hideOwn = loadPref('hideOwn') === true;
+renderOwn();
 readTheme();
-darkQuery.addEventListener('change', () => { readTheme(); buildLayers(); });
+darkQuery.addEventListener('change', () => { readTheme(); layersDirty = true; });
 new ResizeObserver(layout).observe(stage);
 layout();
 loadInfo();

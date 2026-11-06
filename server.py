@@ -35,7 +35,9 @@ from urllib.request import urlopen
 HERE = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
 DEFAULT_PORT = 8787
-TICK_SECONDS = 0.05   # 20 samples a second
+RATES = (20, 10, 5, 2, 1)   # samples a second the view can choose from
+DEFAULT_RATE = 20
+FASTEST_TICK = 1 / max(RATES)
 SESSION_NAME = "PortTrafficViz"
 
 TCP, UDP = 0, 1
@@ -51,18 +53,25 @@ class Accumulator:
     Each port maps to [tcp_local, tcp_remote, udp_local, udp_remote, last_pid]:
     bytes where the port was this machine's end of the connection, and bytes
     where it was the peer's end (443 for a browser talking to a website).
+
+    Traffic this app causes itself (the stream from its server to its window,
+    and anything its own processes send) is kept apart, so the view can show
+    it separately or leave it out.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._ports: dict[int, list[int]] = {}
-        self._in = 0
-        self._out = 0
-        self._events = 0
+        self._reset()
 
-    def add(self, lport: int, rport: int, size: int, proto: int, outbound: bool, pid: int) -> None:
+    def _reset(self) -> None:
+        self._ports: dict[int, list[int]] = {}
+        self._own: dict[int, list[int]] = {}
+        self._totals = [0, 0, 0, 0, 0]  # in, out, own in, own out, events
+
+    def add(self, lport: int, rport: int, size: int, proto: int, outbound: bool, pid: int,
+            own: bool = False) -> None:
         with self._lock:
-            ports = self._ports
+            ports = self._own if own else self._ports
             if lport:
                 e = ports.get(lport)
                 if e is None:
@@ -75,18 +84,19 @@ class Accumulator:
                     e = ports[rport] = [0, 0, 0, 0, 0]
                 e[proto * 2 + 1] += size
                 e[4] = pid
-            if outbound:
-                self._out += size
-            else:
-                self._in += size
-            self._events += 1
+            t = self._totals
+            k = 1 if outbound else 0
+            t[k] += size
+            if own:
+                t[2 + k] += size
+            t[4] += 1
 
     def drain(self):
+        """(ports, own ports, (in, out, own in, own out, events)) since the last call."""
         with self._lock:
-            ports, self._ports = self._ports, {}
-            totals = (self._in, self._out, self._events)
-            self._in = self._out = self._events = 0
-        return ports, totals
+            out = self._ports, self._own, tuple(self._totals)
+            self._reset()
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -260,15 +270,21 @@ class EtwCapture:
     EVENTS = {10: (TCP, True, 4), 11: (TCP, False, 4), 26: (TCP, True, 16), 27: (TCP, False, 16),
               42: (UDP, True, 4), 43: (UDP, False, 4), 58: (UDP, True, 16), 59: (UDP, False, 16)}
 
-    def __init__(self, acc: Accumulator) -> None:
+    def __init__(self, acc: Accumulator, own_port: int = 0, owner_pid: int | None = None) -> None:
         self.acc = acc
         self.adv = _advapi()
         self.session: int | None = None
         self.trace: int | None = None
         self._stopping = False
+        self._halt = threading.Event()
         self._callback = EVENT_RECORD_CALLBACK(self._on_event)
         self._logfile = None
         self.names = ProcessNames().get
+        # This app's own traffic: its web server's port, and the processes it
+        # runs as (this one, plus the window and its browser engine).
+        self.own_port = own_port
+        self._roots = {os.getpid()} | ({owner_pid} if owner_pid else set())
+        self.own_pids = frozenset(self._roots)
 
     def _props(self) -> TraceProperties:
         tp = TraceProperties()
@@ -283,7 +299,7 @@ class EtwCapture:
         # Hand partly filled buffers over every tick; the default 1 s flush
         # would deliver light traffic in once-a-second clumps.
         p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_USE_MS_FLUSH_TIMER
-        p.FlushTimer = round(TICK_SECONDS * 1000)
+        p.FlushTimer = round(FASTEST_TICK * 1000)
         p.LoggerNameOffset = TraceProperties.name.offset
         return tp
 
@@ -325,6 +341,17 @@ class EtwCapture:
             raise OSError(err, f"Couldn't open the trace: {ctypes.FormatError(err).strip()}")
         self.trace = trace
         threading.Thread(target=self._pump, name="etw", daemon=True).start()
+        threading.Thread(target=self._watch_own, name="own-pids", daemon=True).start()
+
+    def _watch_own(self) -> None:
+        """Keep the set of this app's processes current (the browser engine starts its own)."""
+        while True:
+            try:
+                self.own_pids = process_tree(self._roots)
+            except OSError:
+                pass
+            if self._halt.wait(2):
+                return
 
     def _pump(self) -> None:
         handles = (ULONG64 * 1)(self.trace)
@@ -344,12 +371,17 @@ class EtwCapture:
             data = ctypes.string_at(ctypes.c_void_p.from_address(rec + OFF_USER_DATA).value, need)
             pid, size = struct.unpack_from("<II", data, 0)
             dport, sport = struct.unpack_from(">HH", data, 8 + 2 * alen)
-            self.acc.add(sport, dport, size, proto, outbound, pid)
+            # Ours: any socket of this app's processes, and both ends of the
+            # loopback connections to its web server (127.0.0.1 only, IPv4).
+            own = pid in self.own_pids or (alen == 4 and data[8] == 127
+                                           and self.own_port in (sport, dport))
+            self.acc.add(sport, dport, size, proto, outbound, pid, own)
         except Exception:  # never let an exception escape into ETW's thread
             pass
 
     def stop(self) -> None:
         self._stopping = True
+        self._halt.set()
         if self.session is not None:
             self._stop_session()
             self.session = None
@@ -401,6 +433,87 @@ class ProcessNames:
             return ""
         finally:
             self._close(h)
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_k32 = None
+
+
+def _toolhelp():
+    global _k32
+    if _k32 is None:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        for f in (k.Process32FirstW, k.Process32NextW):
+            f.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            f.restype = wintypes.BOOL
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        k.GetProcessTimes.restype = wintypes.BOOL
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        _k32 = k
+    return _k32
+
+
+def _started(k, pid: int) -> int | None:
+    """When a process started (FILETIME ticks), or None if it can't be opened."""
+    h = k.OpenProcess(ProcessNames.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        t = [wintypes.FILETIME() for _ in range(4)]
+        if not k.GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
+            return None
+        return (t[0].dwHighDateTime << 32) | t[0].dwLowDateTime
+    finally:
+        k.CloseHandle(h)
+
+
+def process_tree(roots) -> frozenset[int]:
+    """The given processes and everything they started that's still running."""
+    k = _toolhelp()
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    children: dict[int, list[int]] = {}
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(pe)
+        ok = k.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            children.setdefault(pe.th32ParentProcessID, []).append(pe.th32ProcessID)
+            ok = k.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        k.CloseHandle(snap)
+    started = {}
+    for pid in roots:
+        t = _started(k, pid)
+        if t is not None:
+            started[pid] = t
+    todo = list(started)
+    while todo:
+        parent = todo.pop()
+        for child in children.get(parent, ()):
+            if child in started:
+                continue
+            t = _started(k, child)
+            # Windows reuses process IDs, so a process that's older than its
+            # "parent" was really started by an earlier holder of that ID.
+            if t is not None and t >= started[parent]:
+                started[child] = t
+                todo.append(child)
+    return frozenset(started)
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +572,7 @@ class Demo:
                                rout=1.5e5, pid=1113, ttl=1e9))
         target = 30
         last = time.perf_counter()
-        while not self._stop.wait(TICK_SECONDS / 2):
+        while not self._stop.wait(FASTEST_TICK / 2):
             now = time.perf_counter()
             dt, last = now - last, now
             if rng.random() < dt / 8:
@@ -496,7 +609,7 @@ class Hub:
         self.last_change = time.monotonic()  # when a viewer last connected or left
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=40)  # 2 s of ticks
+        q: queue.Queue = queue.Queue(maxsize=40)  # 2 s of ticks at the fastest rate
         with self._lock:
             self._subs.add(q)
             self.last_change = time.monotonic()
@@ -521,20 +634,43 @@ class Hub:
                 pass
 
 
-def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event) -> None:
+class TickRate:
+    """How often counts go out to the view. The view can change it while running."""
+
+    def __init__(self, hz: int = DEFAULT_RATE) -> None:
+        self.hz = hz
+        self.wake = threading.Event()  # set when the rate changes or the ticker should stop
+
+    @property
+    def seconds(self) -> float:
+        return 1 / self.hz
+
+    def set(self, hz: int) -> None:
+        if hz not in RATES:
+            raise ValueError(f"rate must be one of {RATES}")
+        if hz != self.hz:
+            self.hz = hz
+            self.wake.set()
+
+
+def run_ticker(acc: Accumulator, hub: Hub, names, stop: threading.Event, rate: TickRate) -> None:
     last = time.perf_counter()
-    next_t = last + TICK_SECONDS
+    next_t = last + rate.seconds
     report_t, report = last, [0, 0, 0, 0.0]
     while not stop.is_set():
         delay = next_t - time.perf_counter()
-        if delay > 0 and stop.wait(delay):
-            break
+        if delay > 0 and rate.wake.wait(delay):
+            rate.wake.clear()  # new rate (or stopping): time the next tick from the last one
+            next_t = last + rate.seconds
+            continue
         now = time.perf_counter()
         dt, last = now - last, now
-        next_t = max(next_t + TICK_SECONDS, now)
-        ports, (b_in, b_out, events) = acc.drain()
+        next_t = max(next_t + rate.seconds, now)
+        ports, own, (b_in, b_out, own_in, own_out, events) = acc.drain()
         rows = [[p, e[0], e[1], e[2], e[3], names(e[4])] for p, e in ports.items()]
-        hub.publish(json.dumps({"dt": round(dt, 4), "in": b_in, "out": b_out, "p": rows},
+        own_rows = [[p, e[0], e[1], e[2], e[3]] for p, e in own.items()]
+        hub.publish(json.dumps({"dt": round(dt, 4), "t": rate.seconds, "in": b_in, "out": b_out,
+                                "si": own_in, "so": own_out, "p": rows, "s": own_rows},
                                separators=(",", ":")))
         report[0] += events
         report[1] += b_in
@@ -561,9 +697,25 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/style.css": ("style.css", "text/css; charset=utf-8")}
 
 
-def make_handler(hub: Hub, info: dict, port: int):
+class CountingWriter:
+    """Passes writes through to a connection and reports how many bytes went out."""
+
+    def __init__(self, raw, count) -> None:
+        self._raw, self._count = raw, count
+
+    def write(self, b) -> int:
+        n = self._raw.write(b)
+        self._count(len(b))
+        return n
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def make_handler(hub: Hub, info: dict, port: int, rate: TickRate, on_write=None):
+    """on_write(bytes, client_port) is called for everything sent, when no capture sees it."""
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    info_body = json.dumps(info).encode()
+    allowed_origins = {f"http://{h}" for h in allowed_hosts}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "PortTraffic/1.0"
@@ -571,17 +723,29 @@ def make_handler(hub: Hub, info: dict, port: int):
         def log_message(self, fmt, *args):  # keep the console for status lines
             pass
 
-        def do_GET(self):
+        def setup(self):
+            super().setup()
+            if on_write:
+                client_port = self.client_address[1]
+                self.wfile = CountingWriter(self.wfile, lambda n: on_write(n, client_port))
+
+        def _ours(self) -> bool:
             # Only answer to our own origin, so other web pages can't read this
             # machine's traffic through DNS rebinding.
-            if self.headers.get("Host") not in allowed_hosts:
-                self.send_error(403)
+            if self.headers.get("Host") in allowed_hosts:
+                return True
+            self.send_error(403)
+            return False
+
+        def do_GET(self):
+            if not self._ours():
                 return
             path = self.path.split("?", 1)[0]
             if path == "/events":
                 self._events()
             elif path == "/api/info":
-                self._send(200, "application/json", info_body)
+                body = json.dumps({**info, "tick": rate.seconds}).encode()
+                self._send(200, "application/json", body)
             elif path in STATIC:
                 name, ctype = STATIC[path]
                 try:
@@ -591,6 +755,31 @@ def make_handler(hub: Hub, info: dict, port: int):
                     self.send_error(404)
             else:
                 self.send_error(404)
+
+        def do_POST(self):
+            # POST /api/rate {"hz": 5} sets how many samples a second are sent.
+            # Requiring a JSON body and our own Origin keeps other web pages
+            # from changing it: they can't send JSON here without a CORS
+            # preflight, which this server doesn't answer.
+            if not self._ours():
+                return
+            if self.path.split("?", 1)[0] != "/api/rate":
+                self.send_error(404)
+                return
+            origin = self.headers.get("Origin")
+            ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if (origin is not None and origin not in allowed_origins) or ctype != "application/json":
+                self.send_error(403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 256:
+                    raise ValueError("bad length")
+                rate.set(int(json.loads(self.rfile.read(length))["hz"]))
+            except (ValueError, KeyError, TypeError):
+                self.send_error(400)
+                return
+            self._send(200, "application/json", json.dumps({"tick": rate.seconds}).encode())
 
         def _send(self, code: int, ctype: str, body: bytes) -> None:
             self.send_response(code)
@@ -742,30 +931,46 @@ class Server:
     Used by serve() below and by the desktop app (desktop.py).
     """
 
-    def __init__(self, mode: str, port: int, exact_port: bool = False) -> None:
+    def __init__(self, mode: str, port: int, exact_port: bool = False,
+                 owner_pid: int | None = None) -> None:
+        """owner_pid: the window's process, when capture runs in a separate helper."""
         self.mode = mode
+        self.port = port if exact_port else free_port(port)
         self.acc = Accumulator()
         self.hub = Hub()
-        self.source = Demo(self.acc) if mode == "demo" else EtwCapture(self.acc)
+        self.rate = TickRate()
+        if mode == "demo":
+            self.source = Demo(self.acc)
+            on_write = self._count_own_stream  # nothing captures the real stream in demo mode
+        else:
+            self.source = EtwCapture(self.acc, own_port=self.port, owner_pid=owner_pid)
+            on_write = None
         self.source.start()
         self.done = threading.Event()
         try:
-            info = {"mode": mode, "tick": TICK_SECONDS, "host": socket.gethostname(),
+            info = {"mode": mode, "rates": list(RATES), "host": socket.gethostname(),
                     "services": load_services()}
-            self.port = port if exact_port else free_port(port)
-            self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port),
-                                             make_handler(self.hub, info, self.port))
+            self.httpd = ThreadingHTTPServer(
+                ("127.0.0.1", self.port), make_handler(self.hub, info, self.port, self.rate, on_write))
         except BaseException:
             self.source.stop()
             raise
         self.httpd.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.port}/"
-        threading.Thread(target=run_ticker, args=(self.acc, self.hub, self.source.names, self.done),
+        threading.Thread(target=run_ticker,
+                         args=(self.acc, self.hub, self.source.names, self.done, self.rate),
                          name="ticker", daemon=True).start()
+
+    def _count_own_stream(self, size: int, client_port: int) -> None:
+        # What a capture would see: this server's socket sending, the window's receiving.
+        pid = os.getpid()
+        self.acc.add(self.port, client_port, size, TCP, True, pid, own=True)
+        self.acc.add(client_port, self.port, size, TCP, False, pid, own=True)
 
     def stop_capture(self) -> None:
         if not self.done.is_set():
             self.done.set()
+            self.rate.wake.set()
             self.source.stop()
 
     def run(self) -> None:

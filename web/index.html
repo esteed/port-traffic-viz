@@ -36,24 +36,37 @@
         <option value="1e10">10 Gb/s</option>
       </select>
     </label>
-    <button type="button" id="ctl-zoom">Fit to window</button>
+    <label class="sel" title="How many times a second traffic is sampled and the bars move">Samples
+      <select id="ctl-rate">
+        <option value="20" selected>20/s</option>
+        <option value="10">10/s</option>
+        <option value="5">5/s</option>
+        <option value="2">2/s</option>
+        <option value="1">1/s</option>
+      </select>
+    </label>
+    <label class="chk" title="Leave out traffic this app causes itself: the stream from its capture process to this window, and its browser engine's own requests">
+      <input type="checkbox" id="ctl-own">Hide own traffic
+    </label>
+    <button type="button" id="ctl-zoom" title="Back to the starting zoom and position">Reset view</button>
     <button type="button" id="ctl-pause">Pause</button>
   </div>
 </header>
 <main>
   <div id="stage">
-    <canvas id="cv" role="img" aria-label="Isometric bar grid of traffic per network port. The busiest ports are listed alongside."></canvas>
+    <canvas id="cv" role="img" aria-label="Isometric bar grid of traffic per network port. Scroll to zoom, drag to move. The busiest ports are listed alongside."></canvas>
     <div id="tip" class="tip" hidden></div>
     <div class="legend">
       <span class="item">Traffic per port, log scale
         <span class="muted">100 b/s</span><span id="swatches" class="swatches"></span><span id="scale-max" class="muted">1 Gb/s</span>
       </span>
-      <span class="item"><span id="dyn-swatch" class="sw"></span>Dynamic range 49152–65535</span>
-      <span class="item muted">Hover a cell for details · click to pin</span>
+      <span class="item"><span class="sw own"></span><span id="own-text">This app's own traffic</span></span>
+      <span class="item muted">Scroll to zoom · drag to move · hover for details</span>
     </div>
   </div>
   <aside>
     <h2>Busiest ports</h2>
+    <p class="hint">Click a port to pin it to the top and highlight it. Click again to unpin.</p>
     <ol id="top"><li class="empty">Waiting for traffic…</li></ol>
   </aside>
 </main>
